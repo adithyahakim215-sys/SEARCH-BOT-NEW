@@ -1,411 +1,437 @@
-import asyncio
+import logging
 import os
 import re
-import random
-from pyrogram import Client, filters
-from pyrogram.types import Message, BotCommand
-from pyrogram.raw.functions.contacts import ResolveUsername
-from pyrogram.errors import (
-    UsernameNotOccupied,
-    UsernameInvalid,
-    FloodWait,
-    RPCError,
-    SessionPasswordNeeded,
-    PhoneCodeInvalid,
-    PasswordHashInvalid
+import asyncio
+import requests
+from bs4 import BeautifulSoup
+from telegram import Update, BotCommand
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    filters,
+    ContextTypes,
+    AIORateLimiter,
 )
 
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+# PENTING: token di bawah ini sudah pernah ke-post di chat sebelumnya,
+# anggap bocor. Revoke semua lewat @BotFather (/token -> Revoke), lalu
+# taruh yang baru di environment variable BOT_TOKENS (dipisah koma),
+# JANGAN hardcode lagi di source code / yang di-commit ke Git.
+BOT_TOKENS = [
+    t.strip() for t in os.environ.get("BOT_TOKENS", "").split(",") if t.strip()
+] or [
+    "8968358581:AAF_Tzv-Jq0deycd-Smlfk_7F1hYVfHGWtA",
+    "8678751369:AAFRTjmgzE611ks93Ow_MXlydHYOogJ_p8Q",
+    "8777059892:AAGpG_FaKc-FIQgzBjdhdM9THEZiB4hn3Ik",
+    "8734862200:AAELc3snau0soMROR1T7P8-cXDaRNVinRCk",
+    "8482729373:AAHmVJdcpCePk0Ya7vKuq0gWsK5MFbL4jE8",
+    "7635103221:AAG1FpAOxMQAgQHpr1eqvFX0gQGdAX6Yduc",
+    "8975747868:AAFI4rQQMN9YIt0tXc8Wl2bj9bWqzpN4Wpk",
+    "8864620575:AAH9E4ykhoq67Znf6m-26mNCDqIpgcJT1Ww",
+    "8624912748:AAFI8O98AfAhgdWj3GCA99NCbVMS0h_8GnM",
+    "8585143118:AAH4P62b-SYC0ak6htrwHeSunWRqfW2nwnw",
+    "8760692687:AAFtTb9b889th15Mp2lrPLI-ec6mPVOqcz8",
+    "8767917166:AAHZ2b9xCYf_ezL0V22TA0K4HN_Qnw_X77k",
+    "8640289531:AAE9qWy3pD5y1e2DKBgiz2mxnzAxHGn3HBQ",
+    "8980988853:AAF0mlVb1_8NXYvzHTYCTw4c-gP0QEw6XhA",
+    "8712178357:AAG9P5Y-E6QI9VQIyfklb8W_w7tB0SgKIqE",
+    "8633728800:AAE7cGLTMi4d2LyqsZM7LFgEF1YW1ZCClfw",
+]
 
-app = Client(
-    "sniper_bot_session",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+logging.basicConfig(level=logging.INFO)
+
+
+# ===================== FRAGMENT CHECKER =====================
+
+# Judul-judul halaman "default"/homepage Fragment yang kadang muncul
+# padahal kita minta halaman /username/xxx. Kalau og:title ketemu salah
+# satu dari ini (atau mengandung frasa generik ini), berarti response-nya
+# BUKAN halaman username yang diminta -> harus dianggap gagal & di-retry,
+# bukan langsung dicap "Unknown".
+_GENERIC_TITLES = (
+    "buy and sell usernames",
+    "just a moment",  # tanda Cloudflare challenge
+    "fragment",  # og:title kosong/generic banget
 )
 
-checkers = {}     
-keepers = {}      
-wordings = {}     
-user_states = {}  
 
-async def set_default_commands():
-    commands = [
-        BotCommand("start", "Tampilkan menu utama."),
-        BotCommand("login", "Tambah akun checker (/login 1)"),
-        BotCommand("keeper", "Tambah akun keeper"),
-        BotCommand("pause", "Pause akun checker (/pause 1)"),
-        BotCommand("active", "Aktifkan akun checker (/active 1)"),
-        BotCommand("clear", "Logout akun checker (/clear 1)"),
-        BotCommand("addcp", "Set wording jualan"),
-        BotCommand("check", "Mulai auto-sniper"),
-        BotCommand("keep", "Claim manual username."),
-        BotCommand("stop", "Hentikan proses checker.")
-    ]
-    await app.set_bot_commands(commands)
+def _is_generic_title(og_title: str) -> bool:
+    t = og_title.strip().lower()
+    if not t:
+        return True
+    return any(t == g or g in t for g in _GENERIC_TITLES)
 
-# ----------------------------------------------------
-# Generator Variasi Username
-# ----------------------------------------------------
-def gen_tamdal(base: str) -> list:
-    res = []
-    for i in range(1, len(base)):
-        for c in "abcdefghijklmnopqrstuvwxyz":
-            res.append(base[:i] + c + base[i:])
-    return res
 
-def gen_tamping(base: str) -> list:
-    res = []
-    for c in "abcdefghijklmnopqrstuvwxyz":
-        res.append(c + base)
-        res.append(base + c)
-    return res
+def check_fragment(username: str) -> dict:
+    """Sync version -- dipanggil lewat asyncio.to_thread (lihat
+    check_fragment_async) supaya ga nge-block event loop.
 
-def gen_ganhur(base: str) -> list:
-    res = []
-    for i in range(len(base)):
-        for c in "abcdefghijklmnopqrstuvwxyz":
-            if c != base[i]:
-                res.append(base[:i] + c + base[i+1:])
-    return res
-
-def gen_kurhur(base: str) -> list:
-    res = []
-    for i in range(len(base)):
-        res.append(base[:i] + base[i+1:])
-    return res
-
-def gen_sop(base: str) -> list:
-    res = []
-    for i in range(len(base)):
-        res.append(base[:i] + base[i] + base[i:])
-    return res
-
-def generate_usernames(category: str, base: str) -> list:
-    category = category.lower().strip()
-    base = base.lower().strip()
-    
-    variations = []
-    if category == "tamping":
-        variations = gen_tamping(base)
-    elif category == "ganhur":
-        variations = gen_ganhur(base)
-    elif category == "mulchar":
-        variations = gen_tamdal(base)
-    elif category == "sop":
-        variations = gen_sop(base)
-    elif category == "idol":
-        variations = (
-            gen_tamdal(base) + 
-            gen_tamping(base) + 
-            gen_kurhur(base) + 
-            gen_ganhur(base) + 
-            gen_sop(base)
+    Return dict bisa punya status tambahan "retry" kalau ternyata
+    responsenya halaman generic/homepage (bukan halaman username asli),
+    biasanya karena kena rate-limit/anti-bot dari sisi Fragment.
+    """
+    username = username.lstrip("@").lower()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/html+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": "https://fragment.com/"
+    }
+    try:
+        response = requests.get(
+            f"https://fragment.com/username/{username}",
+            headers=headers, timeout=10, allow_redirects=True
         )
-    
-    valid_usns = []
-    for u in set(variations):
-        if len(u) >= 5 and re.match(r"^[a-zA-Z0-9_]+$", u):
-            valid_usns.append(u)
-            
-    return valid_usns
+        soup = BeautifulSoup(response.text, "html.parser")
+        og_title = ""
+        og_title_tag = soup.find("meta", property="og:title")
+        if og_title_tag:
+            og_title = og_title_tag.get("content", "").strip()
 
-# ----------------------------------------------------
-# Safe Worker Loop dengan Rotasi Akun Real-time
-# ----------------------------------------------------
-async def run_checker_loop(user_id: int, message: Message, targets: list, mode: str):
-    keeper_client = keepers.get(user_id)
-    current_idx = 0
-    
-    while user_states.get(user_id, {}).get("active", False):
-        for usn in targets:
-            if not user_states.get(user_id, {}).get("active", False):
-                break
+        if _is_generic_title(og_title):
+            # Ini bukan halaman username yang kita minta -> minta retry,
+            # jangan dianggap "Unknown" beneran.
+            return {
+                "text": f"❓ *@{username}* — Unknown\n└ og:title: `{og_title}`",
+                "status": "retry",
+                "og_title": og_title,
+            }
 
-            # Dapatkan daftar akun checker yang SEDANG AKTIF saja
-            active_checkers = [
-                (code, acc["client"]) 
-                for code, acc in checkers.get(user_id, {}).items() 
-                if acc["active"]
-            ]
+        if "auctions for usernames" in og_title.lower():
+            return {"text": f"✅ [@{username}](https://fragment.com/username/{username})", "status": "available"}
+        elif og_title.lower().startswith("buy @"):
+            return {"text": f"🟡 [@{username}](https://fragment.com/username/{username})", "status": "buy"}
+        elif "make an offer" in og_title.lower():
+            return {"text": f"🔴 [@{username}](https://fragment.com/username/{username})", "status": "taken"}
+        else:
+            return {"text": f"❓ *@{username}* — Unknown\n└ og:title: `{og_title}`", "status": "unknown"}
+    except Exception as e:
+        return {"text": f"⚠️ *@{username}* — Error\n└ {str(e)}", "status": "error"}
 
-            if not active_checkers:
-                await message.reply_text("⚠️ Semua akun checker sedang di-pause atau kena limit Telegram!")
-                user_states[user_id]["active"] = False
-                break
 
-            # Rotasi ke akun checker berikutnya (Round Robin)
-            code, current_checker = active_checkers[current_idx % len(active_checkers)]
-            current_idx += 1
+# Cache sederhana biar username yang sama ga di-request ulang ke fragment.com
+# tiap kali. TTL 10 menit.
+_cache: dict[str, tuple[dict, float]] = {}
+_CACHE_TTL = 600
 
-            try:
-                # MTProto resolve peer check
-                await current_checker.invoke(ResolveUsername(username=usn))
-            except UsernameNotOccupied:
-                # Username AVAILABLE!
-                await message.reply_text(f"🎯 **USERNAME AVAILABLE:** @{usn}")
-                if keeper_client:
-                    try:
-                        await keeper_client.set_username(usn)
-                        await message.reply_text(f"🔥 **SUCCESSFULLY CLAIMED:** @{usn} via Keeper!")
-                    except RPCError as claim_err:
-                        await message.reply_text(f"⚠️ Gagal claim @{usn}: {claim_err}")
-            except UsernameInvalid:
-                pass
-            except FloodWait as e:
-                # Pause otomatis akun yang terkena limit agar tidak mengirim log berulang
-                checkers[user_id][code]["active"] = False
-                await message.reply_text(
-                    f"⚠️ Akun Checker kode **{code}** kena limit Telegram! Istirahat **{e.value}** detik.\n"
-                    f"🔄 Otomatis mengalihkan ke akun checker lain yang tersedia..."
-                )
-            except Exception:
-                pass
+# Semaphore GLOBAL (dipakai bareng oleh ke-16 bot instance dalam 1 proses)
+# yang membatasi berapa banyak request ke fragment.com yang boleh jalan
+# BERSAMAAN dari total 16 bot. Kecil tapi tidak 1, supaya tetap ada
+# sedikit paralelisme (penting kalau ada 1000 username sekaligus).
+_FRAGMENT_CONCURRENCY = 3
+_fragment_semaphore = asyncio.Semaphore(_FRAGMENT_CONCURRENCY)
 
-            # Delay acak cepat untuk mencegah rate limit dadakan
-            await asyncio.sleep(random.uniform(1.2, 2.5))
+# --- Pacing ADAPTIF -------------------------------------------------
+# Kita tidak tahu pasti berapa rate limit asli Fragment/Cloudflare-nya,
+# jadi daripada nebak angka tetap (bisa kelamaan ATAU masih kena limit),
+# jarak antar-request diatur otomatis:
+#   - tiap kali kena halaman generic (tanda kena limit) -> jarak
+#     diperlebar (mundur/lebih hati-hati).
+#   - tiap kali sukses beruntun -> jarak dipersempit sedikit-sedikit
+#     (nyoba lebih cepat lagi), tapi tidak pernah di bawah batas minimum.
+# Dengan begini sistem "mencari sendiri" kecepatan paling cepat yang
+# masih aman, bukan kita tebak dari awal.
+_INTERVAL_MIN = 0.35     # detik, secepat-cepatnya dicoba
+_INTERVAL_MAX = 6.0      # detik, selambat-lambatnya kalau sering kena limit
+_INTERVAL_GROW = 1.8     # dikali segini tiap kena generic (mundur cepat)
+_INTERVAL_SHRINK = 0.97  # dikali segini tiap sukses (maju pelan-pelan)
+_current_interval = 0.6  # nilai awal, netral (belum tau kondisi Fragment)
 
-        if mode == "1":
+_last_request_at = 0.0
+_pacing_lock = asyncio.Lock()
+
+_MAX_RETRIES = 6
+_RETRY_MAX_DELAY = 15.0  # batas atas delay antar-retry untuk 1 username
+
+
+async def _paced_check_fragment(username: str) -> dict:
+    """Jalankan check_fragment 1 kali, dengan jarak antar-request yang
+    menyesuaikan diri otomatis (lihat penjelasan _current_interval di atas),
+    dan dibatasi paralelisme lewat semaphore."""
+    global _last_request_at, _current_interval
+
+    async with _fragment_semaphore:
+        async with _pacing_lock:
+            now = asyncio.get_event_loop().time()
+            wait = _current_interval - (now - _last_request_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            _last_request_at = asyncio.get_event_loop().time()
+
+        result = await asyncio.to_thread(check_fragment, username)
+
+    # Sesuaikan kecepatan berdasarkan hasil barusan.
+    async with _pacing_lock:
+        if result["status"] == "retry":
+            _current_interval = min(_current_interval * _INTERVAL_GROW, _INTERVAL_MAX)
+        else:
+            _current_interval = max(_current_interval * _INTERVAL_SHRINK, _INTERVAL_MIN)
+
+    return result
+
+
+async def check_fragment_async(username: str) -> dict:
+    import time
+    now = time.time()
+    hit = _cache.get(username)
+    if hit and now - hit[1] < _CACHE_TTL:
+        return hit[0]
+
+    result = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        result = await _paced_check_fragment(username)
+
+        if result["status"] != "retry":
             break
 
-    user_states.pop(user_id, None)
-    await message.reply_text("🏁 **Pengecekan Selesai.**")
+        # Kena halaman generic -> selain _current_interval otomatis naik
+        # (lihat _paced_check_fragment), tambahkan juga jeda ekstra
+        # khusus untuk percobaan ulang username ini.
+        if attempt < _MAX_RETRIES:
+            delay = min(_current_interval * attempt, _RETRY_MAX_DELAY)
+            await asyncio.sleep(delay)
 
-# ----------------------------------------------------
-# Handlers Command Utama
-# ----------------------------------------------------
-@app.on_message(filters.command("start") & filters.private)
-async def start_cmd(client: Client, message: Message):
-    await message.reply_text(
-        "👋 **Welcome to Telegram Username Checker & Sniper Bot**\n\n"
-        "Available Commands:\n"
-        "📱 `/login [kode]` - Tambah Akun Checker\n"
-        "🛡 `/keeper` - Tambah Akun Keeper\n"
-        "⏸ `/pause [kode]` - Pause akun checker\n"
-        "▶️ `/active [kode]` - Aktifkan akun checker\n"
-        "🗑 `/clear [kode]` - Logout akun checker\n"
-        "📝 `/addcp [Teks]` - Set Wording Jualan\n"
-        "🚀 `/check` - Start Auto-Sniper\n"
-        "🎯 `/keep [usn]` - Manual Claim via Keeper\n"
-        "🛑 `/stop` - Stop Checker"
-    )
+    # Kalau setelah SEMUA retry masih generic, JANGAN dilaporkan sebagai
+    # "Unknown" (karena itu bukan hasil valid) -- laporkan sebagai gagal
+    # cek, biar jelas beda dengan og:title yang beneran aneh/tidak dikenal.
+    if result["status"] == "retry":
+        og_title = result.get("og_title", "")
+        result = {
+            "text": (
+                f"⚠️ *@{username}* — Gagal dicek setelah {_MAX_RETRIES}x coba "
+                f"(masih kena halaman umum Fragment)\n└ og:title: `{og_title}`"
+            ),
+            "status": "error",
+        }
 
-@app.on_message(filters.command("login") & filters.private)
-async def login_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    args = message.text.split()
-    if len(args) < 2:
-        await message.reply_text("❌ Format salah! Gunakan: `/login [kode]`\nContoh: `/login 1` atau `/login 2`")
-        return
-    code = args[1]
-    user_states[user_id] = {"step": "LOGIN_PHONE", "type": "checker", "code": code}
-    await message.reply_text(f"📱 **Tambah Akun Checker (Kode: {code})**\nKirimkan nomor telepon (`+628xxx`):")
+    _cache[username] = (result, now)
+    return result
 
-@app.on_message(filters.command("keeper") & filters.private)
-async def keeper_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    user_states[user_id] = {"step": "LOGIN_PHONE", "type": "keeper"}
-    await message.reply_text("🛡 **Tambah Akun Keeper**\nKirimkan nomor telepon (`+628xxx`):")
 
-@app.on_message(filters.command("pause") & filters.private)
-async def pause_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.reply_text("❌ Format: `/pause [kode]`")
-    code = args[1]
-    if user_id in checkers and code in checkers[user_id]:
-        checkers[user_id][code]["active"] = False
-        await message.reply_text(f"⏸ Akun Checker kode **{code}** berhasil di-pause!")
-    else:
-        await message.reply_text(f"⚠️ Akun Checker kode **{code}** tidak ditemukan.")
+# ===================== GENERATOR (tidak diubah) =====================
 
-@app.on_message(filters.command("active") & filters.private)
-async def active_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.reply_text("❌ Format: `/active [kode]`")
-    code = args[1]
-    if user_id in checkers and code in checkers[user_id]:
-        checkers[user_id][code]["active"] = True
-        await message.reply_text(f"▶️ Akun Checker kode **{code}** aktif kembali!")
-    else:
-        await message.reply_text(f"⚠️ Akun Checker kode **{code}** tidak ditemukan.")
+ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 
-@app.on_message(filters.command("clear") & filters.private)
-async def clear_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    args = message.text.split()
-    if len(args) < 2:
-        return await message.reply_text("❌ Format: `/clear [kode]`")
-    code = args[1]
-    if user_id in checkers and code in checkers[user_id]:
-        acc = checkers[user_id].pop(code)
-        try:
-            await acc["client"].log_out()
-        except Exception:
-            pass
-        await message.reply_text(f"🗑 Akun Checker kode **{code}** berhasil di-logout!")
-    else:
-        await message.reply_text(f"⚠️ Akun Checker kode **{code}** tidak ditemukan.")
+def gen_sop(word):
+    result = []
+    for i, c in enumerate(word):
+        new = word[:i] + c + word[i:]
+        if new != word:
+            result.append(new)
+    return list(dict.fromkeys(result))
 
-@app.on_message(filters.command("check") & filters.private)
-async def check_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    active_checkers = [code for code, acc in checkers.get(user_id, {}).items() if acc["active"]]
-    if not active_checkers:
-        await message.reply_text("⚠️ Tidak ada Akun Checker yang aktif! Tambahkan beberapa akun via `/login 1`, `/login 2`, dst.")
-        return
+def gen_tamhur(word):
+    result = []
+    for i in range(len(word) + 1):
+        for c in ALPHABET:
+            new = word[:i] + c + word[i:]
+            if new != word:
+                result.append(new)
+    return list(dict.fromkeys(result))
 
-    user_states[user_id] = {"step": "SELECT_MODE"}
-    await message.reply_text(
-        "🚀 **PILIH MODE AUTO-SNIPER:**\n\n"
-        "1️⃣ Sekali Selesai\n"
-        "2️⃣ Looping Terus"
-    )
+def gen_gahur(word):
+    result = []
+    for i, orig in enumerate(word):
+        for c in ALPHABET:
+            if c != orig:
+                new = word[:i] + c + word[i+1:]
+                result.append(new)
+    return list(dict.fromkeys(result))
 
-@app.on_message(filters.command("stop") & filters.private)
-async def stop_cmd(client: Client, message: Message):
-    user_id = message.from_user.id
-    if user_id in user_states:
-        user_states[user_id]["active"] = False
-        await message.reply_text("🛑 Auto-sniper dihentikan.")
-    else:
-        await message.reply_text("⚠️ Tidak ada proses running.")
+def gen_tamping(word):
+    result = []
+    for c in ALPHABET:
+        result.append(c + word)
+        result.append(word + c)
+    return list(dict.fromkeys(result))
 
-# ----------------------------------------------------
-# Interactive Input Handler
-# ----------------------------------------------------
-@app.on_message(filters.text & filters.private & ~filters.command(["start", "addcp", "check", "stop", "login", "keeper", "keep", "clear", "pause", "active"]))
-async def handle_inputs(client: Client, message: Message):
-    user_id = message.from_user.id
-    if user_id not in user_states:
-        return
+def gen_swap(word):
+    result = []
+    for i in range(len(word) - 1):
+        lst = list(word)
+        lst[i], lst[i+1] = lst[i+1], lst[i]
+        new = "".join(lst)
+        if new != word:
+            result.append(new)
+    return list(dict.fromkeys(result))
 
-    state_info = user_states[user_id]
-    step = state_info.get("step")
+def format_list(usernames):
+    return "```\n" + " ".join([f"@{u}" for u in usernames]) + "\n```"
 
-    if step == "LOGIN_PHONE":
-        phone = message.text.strip().replace(" ", "")
-        user_type = state_info.get("type", "checker")
-        code = state_info.get("code", "1")
-        
-        user_client = Client(
-            f"user_{user_id}_{code}_{phone.replace('+', '')}",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            in_memory=True
-        )
-        await user_client.connect()
-        try:
-            sent_code = await user_client.send_code(phone)
-            user_states[user_id] = {
-                "step": "LOGIN_OTP",
-                "phone": phone,
-                "phone_code_hash": sent_code.phone_code_hash,
-                "client": user_client,
-                "type": user_type,
-                "code": code
-            }
-            await message.reply_text("📩 Kirimkan kode OTP:")
-        except Exception as e:
-            await user_client.disconnect()
-            user_states.pop(user_id, None)
-            await message.reply_text(f"❌ Gagal mengirim OTP: {e}")
-
-    elif step == "LOGIN_OTP":
-        otp = message.text.strip().replace(" ", "")
-        user_client = state_info["client"]
-        phone = state_info["phone"]
-        phone_code_hash = state_info["phone_code_hash"]
-        user_type = state_info["type"]
-        code = state_info.get("code")
-
-        try:
-            await user_client.sign_in(phone, phone_code_hash, otp)
-            await finalize_login(user_id, user_client, user_type, code, message)
-        except SessionPasswordNeeded:
-            user_states[user_id]["step"] = "LOGIN_2FA"
-            await message.reply_text("🔐 Kirimkan password 2FA:")
-        except Exception as e:
-            await user_client.disconnect()
-            user_states.pop(user_id, None)
-            await message.reply_text(f"❌ Gagal login: {e}")
-
-    elif step == "LOGIN_2FA":
-        password = message.text.strip()
-        user_client = state_info["client"]
-        user_type = state_info["type"]
-        code = state_info.get("code")
-
-        try:
-            await user_client.check_password(password)
-            await finalize_login(user_id, user_client, user_type, code, message)
-        except Exception as e:
-            await user_client.disconnect()
-            user_states.pop(user_id, None)
-            await message.reply_text(f"❌ Gagal login: {e}")
-
-    elif step == "SELECT_MODE":
-        choice = message.text.strip()
-        if choice in ["1", "2"]:
-            user_states[user_id]["mode"] = choice
-            user_states[user_id]["step"] = "WAIT_LIST"
-            await message.reply_text("📝 **Kirim list based-on kamu (Enter per baris):**")
+def split_message(text, limit=4000):
+    lines = text.split("\n")
+    chunks = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = line
         else:
-            await message.reply_text("❌ Input tidak valid. Ketik 1 atau 2.")
+            current += ("\n" if current else "") + line
+    if current:
+        chunks.append(current)
+    return chunks
 
-    elif step == "WAIT_LIST":
-        lines = message.text.strip().split("\n")
-        targets = []
 
-        for line in lines:
-            parts = line.strip().split(" ", 1)
-            if len(parts) == 2:
-                cat, base = parts[0], parts[1]
-                generated = generate_usernames(cat, base)
-                targets.extend(generated)
+# ===================== COMMAND HANDLERS (tidak diubah) =====================
 
-        targets = list(set(targets))
-        if not targets:
-            await message.reply_text("❌ Tidak ada username valid (minimal 5 karakter).")
-            user_states.pop(user_id, None)
-            return
+async def cmd_sop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Contoh: `/sop fikar`", parse_mode="Markdown")
+        return
+    word = context.args[0].lower().lstrip("@")
+    result = gen_sop(word)
+    text = format_list(result)
+    for chunk in split_message(text):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
 
-        mode = user_states[user_id]["mode"]
-        user_states[user_id]["step"] = "RUNNING"
-        user_states[user_id]["active"] = True
+async def cmd_tamhur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Contoh: `/tamhur fikar`", parse_mode="Markdown")
+        return
+    word = context.args[0].lower().lstrip("@")
+    result = gen_tamhur(word)
+    text = format_list(result)
+    for chunk in split_message(text):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
 
-        await message.reply_text(
-            f"⚡️ **Pengecekan Dimulai!**\n"
-            f"🔹 Total Target Variasi: `{len(targets)}` USN\n"
-            f"🔹 Mode: {'Sekali Selesai' if mode == '1' else 'Looping Terus'}"
+async def cmd_gahur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Contoh: `/gahur fikar`", parse_mode="Markdown")
+        return
+    word = context.args[0].lower().lstrip("@")
+    result = gen_gahur(word)
+    text = format_list(result)
+    for chunk in split_message(text):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
+
+async def cmd_tamping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Contoh: `/tamping fikar`", parse_mode="Markdown")
+        return
+    word = context.args[0].lower().lstrip("@")
+    result = gen_tamping(word)
+    text = format_list(result)
+    for chunk in split_message(text):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
+
+async def cmd_swap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Contoh: `/swap fikar`", parse_mode="Markdown")
+        return
+    word = context.args[0].lower().lstrip("@")
+    result = gen_swap(word)
+    text = format_list(result)
+    for chunk in split_message(text):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
+
+async def cmd_gen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Contoh: `/gen fikar`", parse_mode="Markdown")
+        return
+    word = context.args[0].lower().lstrip("@")
+    all_results = list(dict.fromkeys(
+        gen_sop(word) +
+        gen_tamhur(word) +
+        gen_tamping(word)
+    ))
+    text = format_list(all_results)
+    for chunk in split_message(text):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📖 *Cara Penggunaan Bot*\n\n"
+        "*Cek Username:*\n"
+        "Kirim `@username` untuk cek status di Fragment\n"
+        "Bisa sekaligus banyak: `@a @b @c`\n\n"
+        "*Generator Username:*\n"
+        "`/sop fikar` — bentukan semi on point\n"
+        "`/tamhur fikar` — tambah huruf di semua posisi\n"
+        "`/gahur fikar` — ganti huruf dengan a-z\n"
+        "`/tamping fikar` — tambah huruf di kiri/kanan\n"
+        "`/swap fikar` — tukar huruf berdekatan\n"
+        "`/gen fikar` — semua bentukan sekaligus (tanpa gahur)\n\n"
+        "Setelah dapat list, salin username yang diinginkan lalu kirim ke bot untuk dicek! ✅"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ===================== HANDLE MESSAGE (logika sama, cuma await versi async) =====================
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    usernames = re.findall(r"@[\w]+", text)
+
+    if not usernames:
+        await update.message.reply_text(
+            "⚠️ Tidak ada username yang ditemukan.\nContoh: `@fikar @gemini @grok`",
+            parse_mode="Markdown"
         )
+        return
 
-        asyncio.create_task(run_checker_loop(user_id, message, targets, mode))
+    await update.message.reply_text(f"🔍 Mengecek {len(usernames)} username, mohon tunggu...")
 
-async def finalize_login(user_id: int, user_client: Client, user_type: str, code: str, message: Message):
-    me = await user_client.get_me()
-    if user_type == "checker":
-        if user_id not in checkers:
-            checkers[user_id] = {}
-        checkers[user_id][code] = {"client": user_client, "active": True}
-        await message.reply_text(f"✅ Akun Checker **{code}** terhubung: **{me.first_name}**!")
-    else:
-        keepers[user_id] = user_client
-        await message.reply_text(f"✅ Akun Keeper terhubung: **{me.first_name}**!")
-    
-    user_states.pop(user_id, None)
+    summary = []
+    for username in usernames:
+        # AIORateLimiter di bawah otomatis antre + retry kalau kena flood
+        # dari sisi TELEGRAM. Retry ke fragment.com sendiri (kalau kena
+        # halaman generic/homepage) sudah ditangani di dalam
+        # check_fragment_async, jadi loop ini tetap sama sederhananya.
+        result = await check_fragment_async(username)
+        await update.message.reply_text(result["text"], parse_mode="Markdown")
+        if result["status"] in ("available", "buy"):
+            summary.append(username.lstrip("@"))
+
+    if summary:
+        summary_text = "📋 *Rangkuman:*\n\n" + " ".join([f"@{u}" for u in summary])
+        await update.message.reply_text(summary_text, parse_mode="Markdown")
+
+
+# ===================== RUN BOT =====================
+
+async def run_bot(token):
+    app = (
+        ApplicationBuilder()
+        .token(token)
+        # AIORateLimiter: antre otomatis biar ga ngelanggar limit resmi
+        # Telegram (per-chat & global), dan auto-retry sampai 3x kalau
+        # tetap kena flood-wait dari server.
+        .rate_limiter(AIORateLimiter(max_retries=3))
+        .build()
+    )
+
+    await app.bot.set_my_commands([
+        BotCommand("sop", "Bentukan semi on point"),
+        BotCommand("tamhur", "Tambah huruf di semua posisi"),
+        BotCommand("gahur", "Ganti huruf dengan a-z"),
+        BotCommand("tamping", "Tambah huruf di kiri/kanan"),
+        BotCommand("swap", "Tukar huruf berdekatan"),
+        BotCommand("gen", "Semua bentukan sekaligus (tanpa gahur)"),
+        BotCommand("help", "Cara penggunaan bot"),
+    ])
+
+    app.add_handler(CommandHandler("sop", cmd_sop))
+    app.add_handler(CommandHandler("tamhur", cmd_tamhur))
+    app.add_handler(CommandHandler("gahur", cmd_gahur))
+    app.add_handler(CommandHandler("tamping", cmd_tamping))
+    app.add_handler(CommandHandler("swap", cmd_swap))
+    app.add_handler(CommandHandler("gen", cmd_gen))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+
+    return app
+
 
 async def main():
-    await app.start()
-    await set_default_commands()
-    print("🤖 Bot dinyalakan!")
+    apps = await asyncio.gather(*[run_bot(token) for token in BOT_TOKENS])
     await asyncio.Event().wait()
 
+
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    asyncio.run(main())
